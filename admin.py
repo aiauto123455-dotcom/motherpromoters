@@ -4,7 +4,7 @@ Real Estate AI - Admin Application
 This file contains everything the property owner (admin) needs:
 - Simple token-based admin login (env-var credentials)
 - Property CRUD (create, read, update, delete)
-- Image upload / delete for a property
+- Image upload / delete for a property (stored in Supabase Storage)
 - Dashboard stats
 - Leads listing
 
@@ -16,16 +16,44 @@ it in memory on the server, and require it on every admin request via the
 (no expiry rotation, no refresh tokens, no persistence across restarts).
 For production, replace this with proper JWT or server-side sessions plus
 HTTPS-only secure cookies.
+
+NOTE ON IMAGE STORAGE (IMPORTANT - READ IF YOU'RE DEBUGGING 404 IMAGES):
+Property images are uploaded to a **Supabase Storage bucket**, not to local
+disk. This is required because Render's filesystem is ephemeral - anything
+written to local disk (e.g. `os.path.join(..., "uploads")`) is wiped on
+every deploy, redeploy, and free-tier spin-down/spin-up cycle. A previous
+version of this file saved images to local disk; the moment the container
+restarted, every image path stored in the database pointed at a file that
+no longer existed on disk, producing 404s on the frontend even though the
+database row and its `image_urls` field were completely intact. Supabase
+Storage is a separate, persistent object store (backed by S3-compatible
+storage), so uploaded files survive restarts/redeploys indefinitely - the
+same way the Postgres database itself already does.
+
+Required environment variables for this to work (see .env.example):
+  SUPABASE_URL              - e.g. https://abcxyzproject.supabase.co
+  SUPABASE_SERVICE_ROLE_KEY - the "service_role" secret key (Project
+                               Settings -> API in the Supabase dashboard).
+                               NEVER use the anon/public key here - only the
+                               service_role key can write to a bucket from
+                               a trusted backend like this one, and it must
+                               never be exposed to any frontend/browser code.
+  SUPABASE_STORAGE_BUCKET   - defaults to "property-images". Create this
+                               bucket in the Supabase dashboard (Storage ->
+                               New bucket) and mark it PUBLIC, so the
+                               returned URLs are directly viewable by buyers
+                               without needing a signed URL on every page
+                               load.
 """
 
 import os
 import json
 import secrets
-import shutil
 import uuid
 from datetime import datetime
 from typing import List, Optional
 
+import httpx
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, Header
 from pydantic import BaseModel, Field
 
@@ -148,12 +176,122 @@ class Lead(Base):
 Base.metadata.create_all(bind=engine)
 
 
+# ---------------------------------------------------------------------------
+# Supabase Storage configuration (persistent image storage)
+# ---------------------------------------------------------------------------
+# See the module docstring above for the full explanation of why this
+# exists instead of local-disk storage. In short: Render's disk is
+# ephemeral, Supabase Storage is not.
+
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
+SUPABASE_STORAGE_BUCKET = os.getenv("SUPABASE_STORAGE_BUCKET", "property-images")
+
+STORAGE_CONFIGURED = bool(SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY)
+
+# Legacy local-disk directory. No longer written to for new uploads, but
+# kept so that ANY image path already stored in the database from before
+# this migration (i.e. an old "/uploads/xyz.jpg" row) doesn't crash
+# anything that still references this constant. main.py still mounts this
+# directory as a static route for backward compatibility with any such
+# legacy rows, though on Render those specific old files are already gone
+# (that's the bug this migration fixes) - new uploads never touch this
+# path anymore.
 ADMIN_UPLOAD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "uploads")
 os.makedirs(ADMIN_UPLOAD_DIR, exist_ok=True)
 
 ALLOWED_IMAGE_EXTENSIONS = {"jpg", "jpeg", "png", "webp"}
 MAX_IMAGE_SIZE_BYTES = 5 * 1024 * 1024  # 5 MB per image
 MAX_IMAGES_PER_PROPERTY = 3  # a property can have at most 3 listing photos
+
+_EXT_TO_CONTENT_TYPE = {
+    "jpg": "image/jpeg",
+    "jpeg": "image/jpeg",
+    "png": "image/png",
+    "webp": "image/webp",
+}
+
+
+def _storage_object_path(filename: str) -> str:
+    """Path of an object *within* the bucket (not the full URL)."""
+    return filename
+
+
+def _storage_public_url(filename: str) -> str:
+    """Public, directly-viewable URL for an object in the bucket. Requires
+    the bucket to be marked Public in the Supabase dashboard."""
+    return f"{SUPABASE_URL}/storage/v1/object/public/{SUPABASE_STORAGE_BUCKET}/{filename}"
+
+
+def _require_storage_configured():
+    if not STORAGE_CONFIGURED:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Image storage is not configured on the server. Set "
+                "SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY in the "
+                "environment (see admin.py module docstring)."
+            ),
+        )
+
+
+def upload_to_supabase_storage(filename: str, contents: bytes, content_type: str) -> str:
+    """Uploads raw bytes to the configured Supabase Storage bucket and
+    returns the public URL. Raises HTTPException on failure so callers can
+    surface a clean error to the admin instead of silently losing the
+    upload."""
+    _require_storage_configured()
+
+    url = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_STORAGE_BUCKET}/{_storage_object_path(filename)}"
+    headers = {
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+        "apikey": SUPABASE_SERVICE_ROLE_KEY,
+        "Content-Type": content_type,
+        # "3600" upstream cache-control (seconds); harmless default, files
+        # are content-addressed by a random uuid so staleness isn't a risk.
+        "x-upsert": "false",
+    }
+    try:
+        resp = httpx.post(url, headers=headers, content=contents, timeout=30.0)
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"Could not reach image storage: {exc}") from exc
+
+    if resp.status_code not in (200, 201):
+        print(f"[admin] Supabase Storage upload failed ({resp.status_code}): {resp.text}")
+        raise HTTPException(
+            status_code=502,
+            detail="Failed to upload image to storage. Please try again.",
+        )
+
+    return _storage_public_url(filename)
+
+
+def delete_from_supabase_storage(filename: str) -> None:
+    """Best-effort delete of an object from the bucket. Never raises - a
+    failed cleanup shouldn't block the admin from removing the DB
+    reference, it just means an orphaned file sits in the bucket."""
+    if not STORAGE_CONFIGURED:
+        return
+    url = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_STORAGE_BUCKET}/{_storage_object_path(filename)}"
+    headers = {
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+        "apikey": SUPABASE_SERVICE_ROLE_KEY,
+    }
+    try:
+        resp = httpx.delete(url, headers=headers, timeout=15.0)
+        if resp.status_code not in (200, 204):
+            print(f"[admin] warning: Supabase Storage delete returned {resp.status_code}: {resp.text}")
+    except httpx.HTTPError as exc:
+        print(f"[admin] warning: failed to delete '{filename}' from storage: {exc}")
+
+
+def _filename_from_image_url(image_url: str) -> str:
+    """Extracts the bare storage filename from either a full Supabase
+    public URL (new-style) or a legacy '/uploads/xyz.jpg' local path
+    (old-style), so delete logic works for both without special-casing
+    every call site."""
+    return image_url.rsplit("/", 1)[-1]
+
 
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "change_this_password")
@@ -388,14 +526,14 @@ def delete_property(property_id: int, username: str = Depends(require_admin), db
     if not prop:
         raise HTTPException(status_code=404, detail="Property not found")
 
-    # Remove associated image files from disk
+    # Remove associated image files from Supabase Storage (best-effort -
+    # see delete_from_supabase_storage's docstring for why this never
+    # raises and never blocks the property row deletion below).
     try:
         images = json.loads(prop.image_urls) if prop.image_urls else []
         for img_path in images:
-            filename = os.path.basename(img_path)
-            full_path = os.path.join(ADMIN_UPLOAD_DIR, filename)
-            if os.path.exists(full_path):
-                os.remove(full_path)
+            filename = _filename_from_image_url(img_path)
+            delete_from_supabase_storage(filename)
     except Exception as exc:
         print(f"[admin] warning: failed to remove image files for property {property_id}: {exc}")
 
@@ -427,10 +565,10 @@ def update_property_status(
 
 
 # ---------------------------------------------------------------------------
-# Image upload / delete
+# Image upload / delete (Supabase Storage - see module docstring)
 # ---------------------------------------------------------------------------
 
-def _validate_image(file: UploadFile, contents: bytes):
+def _validate_image(file: UploadFile, contents: bytes) -> str:
     ext = file.filename.rsplit(".", 1)[-1].lower() if "." in file.filename else ""
     if ext not in ALLOWED_IMAGE_EXTENSIONS:
         raise HTTPException(
@@ -449,6 +587,8 @@ async def upload_property_images(
     username: str = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
+    _require_storage_configured()
+
     prop = db.query(Property).filter(Property.id == property_id).first()
     if not prop:
         raise HTTPException(status_code=404, detail="Property not found")
@@ -472,19 +612,20 @@ async def upload_property_images(
             ),
         )
 
+    uploaded_urls: List[str] = []
     for file in files:
         contents = await file.read()
         ext = _validate_image(file, contents)
 
-        # Safe, unpredictable filename - prevents path traversal and collisions.
+        # Safe, unpredictable filename - prevents path traversal and
+        # collisions, and doubles as the object key in the bucket.
         safe_filename = f"property_{property_id}_{uuid.uuid4().hex[:12]}.{ext}"
-        dest_path = os.path.join(ADMIN_UPLOAD_DIR, safe_filename)
+        content_type = _EXT_TO_CONTENT_TYPE.get(ext, "application/octet-stream")
 
-        with open(dest_path, "wb") as f:
-            f.write(contents)
+        public_url = upload_to_supabase_storage(safe_filename, contents, content_type)
+        uploaded_urls.append(public_url)
 
-        existing_images.append(f"/uploads/{safe_filename}")
-
+    existing_images.extend(uploaded_urls)
     prop.image_urls = json.dumps(existing_images)
     prop.updated_at = utcnow()
     db.add(prop)
@@ -513,13 +654,11 @@ def delete_property_image(
     except json.JSONDecodeError:
         images = []
 
-    updated_images = [img for img in images if os.path.basename(img) != image_name]
+    updated_images = [img for img in images if _filename_from_image_url(img) != image_name]
     if len(updated_images) == len(images):
         raise HTTPException(status_code=404, detail="Image not found on this property")
 
-    full_path = os.path.join(ADMIN_UPLOAD_DIR, image_name)
-    if os.path.exists(full_path):
-        os.remove(full_path)
+    delete_from_supabase_storage(image_name)
 
     prop.image_urls = json.dumps(updated_images)
     prop.updated_at = utcnow()
