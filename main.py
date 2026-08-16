@@ -1264,6 +1264,25 @@ LOCALIZED_MESSAGES = {
 # Buyer-facing routes
 # ---------------------------------------------------------------------------
 
+@app.get("/")
+def root():
+    """Bare-URL landing response. This app is a JSON API with no HTML
+    frontend of its own, so there's nothing to render at '/' - but without
+    an explicit route here, FastAPI returns a 404 for GET/HEAD requests to
+    the base URL (visible in Render's logs as 'GET / 404 Not Found' on
+    every deploy). Returning a small 200 here is just informational -
+    it points callers at /docs (FastAPI's built-in interactive API
+    explorer) and /api/health, and confirms the service name/version so a
+    monitoring tool hitting '/' gets a real 200 instead of a false-alarm
+    404."""
+    return {
+        "service": "Real Estate AI",
+        "status": "ok",
+        "docs": "/docs",
+        "health": "/api/health",
+    }
+
+
 @app.get("/api/health")
 def health_check():
     return {"status": "ok", "service": "real-estate-ai"}
