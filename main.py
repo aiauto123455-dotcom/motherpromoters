@@ -12,6 +12,17 @@ This file contains:
 
 The admin-only routes live in admin.py and are included into this app
 via the `admin_router`.
+
+IMAGE STORAGE NOTE: property images are uploaded and stored via Supabase
+Storage (see admin.py's module docstring for the full explanation and
+required env vars), NOT on this server's local disk. The `/uploads` static
+mount below is kept ONLY for backward compatibility with any pre-migration
+database rows that still contain an old local "/uploads/xyz.jpg" style
+path - those specific old files will still 404 (they were lost to Render's
+ephemeral filesystem before this migration), but any image uploaded from
+now on gets a permanent Supabase Storage URL that survives restarts and
+redeploys, and is returned directly in `image_urls` - it never touches this
+route at all.
 """
 
 import os
@@ -93,6 +104,12 @@ if OPENROUTER_SITE_NAME:
     _openrouter_headers["X-Title"] = OPENROUTER_SITE_NAME
 
 CONVERSATION_LIFETIME_HOURS = 48
+
+# Legacy local-upload directory. No longer written to (see module
+# docstring) - kept only so the backward-compat static mount below has
+# somewhere to point, and so this constant still exists for anything
+# importing it (e.g. admin.py's ADMIN_UPLOAD_DIR sanity-check import at the
+# bottom of this file).
 UPLOAD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "uploads")
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -336,14 +353,16 @@ app.add_middleware(
 # backend directory (which would expose realestate.db/.env) - only
 # the uploads folder is mounted.
 #
-# NOTE for Render: the filesystem is ephemeral on most Render plans (web
-# services without a persistent Disk lose local files on every deploy/
-# restart). If property images need to survive restarts, either attach a
-# Render Disk mounted at UPLOAD_DIR, or move image storage to Supabase
-# Storage / S3 / Cloudinary. This is unrelated to the Supabase Postgres
-# migration but worth knowing before you upload real listing photos in
-# production - Supabase Storage in particular is a natural fit since
-# you're already on Supabase for the database.
+# BACKWARD COMPATIBILITY ONLY: as of this version, new property images are
+# uploaded directly to Supabase Storage (see admin.py) and their full
+# public URL is stored in `image_urls` - this route is no longer used for
+# any new upload. It's kept mounted only so the app doesn't error out if
+# any pre-migration database row still references an old local
+# "/uploads/xyz.jpg" path. Those specific old files were already lost to
+# Render's ephemeral filesystem (that's the bug this migration fixes) and
+# will keep 404ing here regardless - re-upload those properties' photos
+# from the admin dashboard once to move them onto Supabase Storage
+# permanently.
 app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
 
