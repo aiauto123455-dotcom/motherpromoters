@@ -41,33 +41,61 @@ from sqlalchemy.orm import Session
 
 from sqlalchemy import create_engine, Column, Integer, String, Float, Text, DateTime
 from sqlalchemy.orm import sessionmaker, declarative_base
+from sqlalchemy.pool import NullPool
 
 # ---------------------------------------------------------------------------
 # Reuse the exact same database configuration as main.py
 # ---------------------------------------------------------------------------
 #
 # IMPORTANT: this mirrors main.py's DB setup exactly (same URL normalization,
-# same conditional connect_args) because admin.py builds its OWN engine
-# rather than importing main's. If these two ever drift apart - e.g. only
-# main.py gets the Postgres fix - admin.py silently keeps using SQLite-only
-# connect_args and crashes the moment DATABASE_URL points at Postgres,
-# since check_same_thread is not a valid Postgres connect arg.
-
-RAW_DATABASE_URL = os.getenv("DATABASE_URL")
+# same pgbouncer/Supavisor handling, same conditional connect_args) because
+# admin.py builds its OWN engine rather than importing main's. If these two
+# ever drift apart, admin.py can silently misconfigure its connection the
+# moment DATABASE_URL points somewhere main.py handles differently - so any
+# change to main.py's DB setup should be mirrored here too.
+#
+# FIX: the previous version read `os.getenv("DATABASE_URL")` with NO
+# default, unlike main.py's `os.getenv("DATABASE_URL", "sqlite:///...")`.
+# If DATABASE_URL was ever unset (e.g. local dev without a .env, or a
+# misconfigured deploy), RAW_DATABASE_URL was `None`, and
+# `None.startswith("postgres://")` raised AttributeError at import time -
+# which crashed the entire app on startup, since main.py imports
+# admin_router from this module. The default below matches main.py exactly
+# so admin.py can never crash on import for this reason, and both modules
+# fall back to the same local SQLite file in the same circumstances.
+RAW_DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./realestate.db")
 
 if RAW_DATABASE_URL.startswith("postgres://"):
-    # SQLAlchemy 1.4+/2.x only accepts "postgresql://" - Render/Heroku-style
-    # providers commonly still hand out the old "postgres://" scheme.
+    # SQLAlchemy 1.4+/2.x only accepts "postgresql://" - Supabase/Render/
+    # Heroku-style providers commonly still hand out the old
+    # "postgres://" scheme.
     DATABASE_URL = RAW_DATABASE_URL.replace("postgres://", "postgresql://", 1)
 else:
     DATABASE_URL = RAW_DATABASE_URL
 
 IS_SQLITE = DATABASE_URL.startswith("sqlite")
 
+# Same pooled-Supabase (Supavisor/pgbouncer, transaction mode) detection as
+# main.py - see the long comment there for why this needs NullPool and
+# disabled statement caching. Kept as a literal copy rather than an import
+# to avoid any import-order coupling between the two modules.
+_looks_pooled = (":6543" in DATABASE_URL) or ("pooler.supabase.com" in DATABASE_URL)
+IS_POOLED_PGBOUNCER = os.getenv(
+    "SUPABASE_POOLED", "true" if _looks_pooled else "false"
+).strip().lower() in ("1", "true", "yes")
+
 _engine_kwargs = {}
 if IS_SQLITE:
     _engine_kwargs["connect_args"] = {"check_same_thread": False}
+elif IS_POOLED_PGBOUNCER:
+    _engine_kwargs["poolclass"] = NullPool
+    _engine_kwargs["connect_args"] = {
+        "prepare_threshold": None,
+        "options": "-c statement_timeout=30000",
+    }
+    _engine_kwargs["pool_pre_ping"] = True
 else:
+    # Direct Supabase connection (port 5432) or any other plain Postgres.
     # Avoids "SSL connection has been closed unexpectedly" errors from
     # managed Postgres providers dropping idle connections.
     _engine_kwargs["pool_pre_ping"] = True
