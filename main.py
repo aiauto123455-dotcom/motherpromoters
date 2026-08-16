@@ -3,7 +3,8 @@ Real Estate AI - Main Application
 ==================================
 This file contains:
 - App setup (FastAPI, CORS, static files)
-- Database models and connection (SQLAlchemy + PostgreSQL, SQLite fallback)
+- Database models and connection (SQLAlchemy + Supabase Postgres, SQLite
+  fallback for local dev)
 - Buyer-facing routes: chat, property search, leads, health check
 - Conversation expiration + cleanup logic
 - Groq AI integration, with an OpenRouter fallback (no RAG, no embeddings,
@@ -40,6 +41,7 @@ from sqlalchemy import (
     DateTime,
 )
 from sqlalchemy.orm import sessionmaker, declarative_base, Session
+from sqlalchemy.pool import NullPool
 
 from groq import Groq
 
@@ -149,17 +151,53 @@ def _call_openrouter(model: str, messages: List[dict], temperature: float, max_t
 
 
 # ---------------------------------------------------------------------------
-# Database setup
+# Database setup (Supabase Postgres, pooled/transaction-mode by default)
 # ---------------------------------------------------------------------------
 #
-# Render's managed Postgres (and most other hosts) inject a DATABASE_URL
-# env var. Two host-specific quirks handled below:
+# Supabase gives you two connection strings for a project:
 #
-#   1. Some providers (Render, old Heroku links) hand out a URL that starts
-#      with "postgres://". SQLAlchemy 1.4+/2.x only accepts the
-#      "postgresql://" scheme and raises on the old one, so we normalize it.
+#   1. DIRECT       - port 5432, e.g.
+#      postgresql://postgres:[PASSWORD]@db.<project-ref>.supabase.co:5432/postgres
+#      A small, fixed number of connections. Fine for a single long-lived
+#      server process, but easy to exhaust if you scale to multiple web
+#      workers/instances.
+#
+#   2. POOLED (Supavisor, "Transaction" mode) - port 6543, e.g.
+#      postgresql://postgres.<project-ref>:[PASSWORD]@aws-0-<region>.pooler.supabase.com:6543/postgres
+#      Meant for exactly this kind of deployment (Render, serverless,
+#      many workers). This is what we assume by default here.
+#
+# Set DATABASE_URL in your environment to whichever one you're using (the
+# pooled URL is what Supabase's dashboard calls "Connection pooling" ->
+# "Transaction" mode). Example .env line:
+#
+#   DATABASE_URL=postgresql://postgres.abcxyzproject:yourpassword@aws-0-ap-south-1.pooler.supabase.com:6543/postgres
+#
+# Two host-specific quirks handled below:
+#
+#   1. Some providers hand out a URL starting with "postgres://" instead of
+#      "postgresql://". SQLAlchemy 1.4+/2.x only accepts the latter, so we
+#      normalize it.
 #   2. `check_same_thread` is a SQLite-only connect arg - it errors out on
 #      Postgres, so it's only passed when we're actually on SQLite.
+#
+# IMPORTANT - pgbouncer "Transaction" mode caveats:
+# Supabase's pooler multiplexes many client connections over a smaller set
+# of real Postgres connections, reused per-transaction rather than
+# per-session. That breaks two things SQLAlchemy/psycopg2 do by default:
+#
+#   - Prepared statement caching (psycopg2/asyncpg can try to reuse a
+#     prepared statement name across what the pooler considers different
+#     underlying connections, causing
+#     "prepared statement already exists" errors).
+#   - SQLAlchemy's own connection pool sitting on top of pgbouncer's pool
+#     ("double pooling"), which can hand out stale/dead connections.
+#
+# We address both by: (a) using NullPool so SQLAlchemy doesn't maintain its
+# own pool on top of Supavisor's, and (b) disabling statement caching via
+# psycopg2 connect_args. pool_pre_ping is kept so a connection that Supavisor
+# has silently dropped gets transparently replaced instead of surfacing as a
+# 500 on the next request.
 #
 # No DATABASE_URL set at all -> falls back to a local SQLite file, which
 # keeps local dev / `docker run` without a DB attached working as before.
@@ -168,21 +206,42 @@ RAW_DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./realestate.db")
 
 if RAW_DATABASE_URL.startswith("postgres://"):
     # SQLAlchemy dropped support for the bare "postgres://" scheme;
-    # Render/Heroku-style providers still commonly issue it.
+    # Supabase/Render/Heroku-style providers still commonly issue it.
     DATABASE_URL = RAW_DATABASE_URL.replace("postgres://", "postgresql://", 1)
 else:
     DATABASE_URL = RAW_DATABASE_URL
 
 IS_SQLITE = DATABASE_URL.startswith("sqlite")
 
+# Explicit switch for "am I talking to Supabase's pooled (pgbouncer)
+# endpoint" - detected by the well-known pooler host/port Supabase uses,
+# or overridable via SUPABASE_POOLED env var if you ever front it
+# differently (e.g. through your own pgbouncer).
+_looks_pooled = (":6543" in DATABASE_URL) or ("pooler.supabase.com" in DATABASE_URL)
+IS_POOLED_PGBOUNCER = os.getenv(
+    "SUPABASE_POOLED", "true" if _looks_pooled else "false"
+).strip().lower() in ("1", "true", "yes")
+
 _engine_kwargs = {}
 if IS_SQLITE:
     _engine_kwargs["connect_args"] = {"check_same_thread": False}
+elif IS_POOLED_PGBOUNCER:
+    # Transaction-mode pgbouncer: don't layer SQLAlchemy's pool on top of
+    # Supavisor's, and disable psycopg2's prepared-statement cache so we
+    # never try to reuse a statement name against a connection the pooler
+    # has since handed to someone else.
+    _engine_kwargs["poolclass"] = NullPool
+    _engine_kwargs["connect_args"] = {
+        "prepare_threshold": None,  # psycopg2 (v3-style) - no-op on psycopg2 but harmless
+        "options": "-c statement_timeout=30000",  # 30s safety timeout per statement
+    }
+    _engine_kwargs["pool_pre_ping"] = True
 else:
+    # Direct Supabase connection (port 5432) or any other plain Postgres.
     # pool_pre_ping avoids "SSL connection has been closed unexpectedly"
-    # errors from Render Postgres dropping idle connections after a period
-    # of inactivity - SQLAlchemy will transparently reconnect instead of
-    # surfacing a 500 on the next request.
+    # errors from a managed Postgres provider dropping idle connections
+    # after a period of inactivity - SQLAlchemy will transparently
+    # reconnect instead of surfacing a 500 on the next request.
     _engine_kwargs["pool_pre_ping"] = True
 
 engine = create_engine(DATABASE_URL, **_engine_kwargs)
@@ -280,9 +339,11 @@ app.add_middleware(
 # NOTE for Render: the filesystem is ephemeral on most Render plans (web
 # services without a persistent Disk lose local files on every deploy/
 # restart). If property images need to survive restarts, either attach a
-# Render Disk mounted at UPLOAD_DIR, or move image storage to S3/Cloudinary/
-# similar object storage. This is unrelated to the Postgres migration but
-# worth knowing before you upload real listing photos in production.
+# Render Disk mounted at UPLOAD_DIR, or move image storage to Supabase
+# Storage / S3 / Cloudinary. This is unrelated to the Supabase Postgres
+# migration but worth knowing before you upload real listing photos in
+# production - Supabase Storage in particular is a natural fit since
+# you're already on Supabase for the database.
 app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
 
@@ -388,7 +449,7 @@ def search_properties(
     limit: int = 20,
 ) -> List[Property]:
     """Plain filtering via SQLAlchemy's query API - works identically on
-    SQLite and Postgres. No embeddings, no vector search - just
+    SQLite and Postgres/Supabase. No embeddings, no vector search - just
     straightforward filters, applied only when provided."""
     query = db.query(Property)
 
@@ -946,8 +1007,8 @@ SERVICE_AREAS = [
 #
 # NOTE for Render: if you ever run more than one web instance/worker,
 # this dict is per-process, so "that one" resolution won't be shared
-# across instances. Fine at 1 instance; move to Postgres/Redis-backed
-# state if you scale horizontally.
+# across instances. Fine at 1 instance; move to a Supabase table
+# (or Redis) if you scale horizontally.
 _last_shown_properties: dict = {}
 
 
